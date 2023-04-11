@@ -75,13 +75,74 @@ func NewAuthenticator(conf Config, sessionManager *scs.SessionManager) (*Authent
 	}, nil
 }
 
-func (a *Authenticator) IsAuthenticated(next http.Handler) http.Handler {
-	// TODO: jwt sessions here
+func (a *Authenticator) Protect(next http.Handler, requiredPermissions ...string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// TODO perform the authentication mechanism here
-		// - just check if authenticated
-		// - add a second route for roles?
-		log.Print("not checking authentication but allowing through!")
+		var err error
+
+		// first, get the raw token from the requests session
+		rawAccessToken := a.SessionManager.GetString(r.Context(), "accessToken")
+		if rawAccessToken == "" {
+			log.Print("unable to get raw access token from session manager")
+
+			w.Header().Add("content-type", "text/plain")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, err = w.Write([]byte("forbidden - unauthenticated"))
+			if err != nil {
+				log.Printf("error writing content: %s", err.Error())
+				return
+			}
+
+			return
+		}
+
+		log.Printf("accessToken: %s", rawAccessToken) // TODO: clean up
+
+		// second, check the token for validity
+		idToken, err := a.VerifyRawToken(r.Context(), rawAccessToken)
+		if err != nil {
+			log.Printf("forbidden - error verifying token in secured route: %s", err.Error())
+
+			w.Header().Add("content-type", "text/plain")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, err := w.Write([]byte(fmt.Sprintf("forbidden - error verifying token: %s", err.Error())))
+			if err != nil {
+				log.Printf("error writing content: %s", err.Error())
+				return
+			}
+
+			return
+		}
+
+		// third, if permissions are required for the route, check them
+		if len(requiredPermissions) > 0 {
+			isAllowed, err := a.CheckClaims(r.Context(), idToken, requiredPermissions...)
+			if err != nil {
+				log.Printf("error checking claims in secured route: %s", err.Error())
+
+				w.Header().Add("content-type", "text/plain")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, err := w.Write([]byte("forbidden"))
+				if err != nil {
+					log.Printf("error writing content: %s", err.Error())
+					return
+				}
+
+				return
+			}
+			if !isAllowed {
+				w.Header().Add("content-type", "text/plain")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, err := w.Write([]byte("insufficient access rights"))
+				if err != nil {
+					log.Printf("error writing content: %s", err.Error())
+					return
+				}
+
+				return
+			}
+		}
+
+		// the call is fully authenticated and authorized, call the next handler
 		next.ServeHTTP(w, r)
 	})
 }
@@ -105,57 +166,80 @@ func (a *Authenticator) Callback() http.Handler {
 		if state == "" {
 			log.Printf("empty state parameter is invalid. Expected %s.", "1234567890") // TODO:
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Failed to exchange an authorization code for a token."))
+			_, err := w.Write([]byte("Failed to exchange an authorization code for a token."))
+			if err != nil {
+				log.Printf("error writing to response writer: %s", err.Error())
+				return
+			}
+
 			return
 		}
 
 		if state != "1234567890" { // TODO:
 			log.Printf("invalid state parameter. Expected %s but got %s", "todo", state)
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Failed to exchange an authorization code for a token."))
+			_, err := w.Write([]byte("Failed to exchange an authorization code for a token."))
+			if err != nil {
+				log.Printf("error writing to response writer: %s", err.Error())
+				return
+			}
+
 			return
 		}
 
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Failed to exchange an authorization code for a token."))
+			_, err := w.Write([]byte("Failed to exchange an authorization code for a token."))
+			if err != nil {
+				log.Printf("error writing to response writer: %s", err.Error())
+				return
+			}
+
 			return
 		}
 
 		token, err := a.oAuthConfig.Exchange(ctx, code)
 		if err != nil {
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Failed to exchange an authorization code for a token."))
+			_, err := w.Write([]byte("failed to exchange an authorization code for a token."))
+			if err != nil {
+				log.Printf("error writing to response writer: %s", err.Error())
+				return
+			}
+
 			return
 		}
 
-		log.Printf("token: %s", token.AccessToken) // TODO: clean up
 		idToken, err := a.VerifyIDToken(ctx, token)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("Failed to verify token."))
+			_, err := w.Write([]byte("failed to verify token."))
+			if err != nil {
+				log.Printf("error writing to response writer: %s", err.Error())
+				return
+			}
+
 			return
 		}
 
 		var claims map[string]interface{}
 		if err := idToken.Claims(&claims); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(err.Error()))
+			_, err := w.Write([]byte(err.Error()))
+			if err != nil {
+				log.Printf("error writing to response writer: %s", err.Error())
+				return
+			}
+			
 			return
 		}
-		for k, v := range claims {
-			log.Printf("claim %s: %v", k, v)
-		}
 
-		// claims->Subject // TODO: this as a user id? subject identifies the user
-
-		// TODO: store the token in a session
 		a.SessionManager.Put(r.Context(), "email", claims["email"])
 		a.SessionManager.Put(r.Context(), "accessToken", token.AccessToken)
 
 		// Redirect to logged in page.
-		http.Redirect(w, r, "/test", http.StatusTemporaryRedirect)
+		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 	})
 }
 
@@ -187,7 +271,7 @@ func (a *Authenticator) VerifyRawToken(ctx context.Context, token string) (*oidc
 	return idToken, nil
 }
 
-func (a *Authenticator) GetClaimsFromToken(ctx context.Context, idToken *oidc.IDToken) (map[string]any, error) {
+func (a *Authenticator) GetClaimsFromToken(ctx context.Context, idToken *oidc.IDToken) (map[string]interface{}, error) {
 	var claims map[string]interface{}
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("error unmarshaling claims from token: %w", err)
@@ -202,16 +286,14 @@ func (a *Authenticator) CheckClaims(ctx context.Context, idToken *oidc.IDToken, 
 		return false, fmt.Errorf("error unmarshaling claims from token: %w", err)
 	}
 
-	log.Printf("claims: %+v", claims)
-
-	// only if all permissions are present the result is true
+	// build up a string slice containing all permissions from the token
 	rawTokenPermissions := claims["permissions"].([]interface{})
-	
 	tokenPermissions := make([]string, len(rawTokenPermissions))
 	for i, v := range rawTokenPermissions {
 		tokenPermissions[i] = fmt.Sprint(v)
 	}
 
+	// only if all permissions are present the result is true
 	for _, requiredPermission := range requiredPermissions {
 		isPresent := contains(tokenPermissions, requiredPermission)
 		if !isPresent {
@@ -222,9 +304,10 @@ func (a *Authenticator) CheckClaims(ctx context.Context, idToken *oidc.IDToken, 
 	return true, nil
 }
 
-func contains[T comparable](data []T, search T) bool {
-	for _, d := range data {
-		if d == search {
+// contains checks if the given token exists in the container
+func contains[T comparable](container []T, token T) bool {
+	for _, d := range container {
+		if d == token {
 			return true
 		}
 	}

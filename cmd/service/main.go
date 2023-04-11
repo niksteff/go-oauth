@@ -13,70 +13,29 @@ import (
 	"github.com/niksteff/go-reserv/internal/config"
 )
 
-func securedRoute(authenticator *auth.Authenticator, requiredClaims ...string) http.Handler {
+func helloRoute(session *scs.SessionManager) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
 
-		accessToken := authenticator.SessionManager.GetString(r.Context(), "accessToken")
-		if accessToken == "" {
-			w.Header().Add("content-type", "text/plain")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, err = w.Write([]byte("forbidden"))
-			if err != nil {
-				log.Printf("error writing content: %s", err.Error())
-				return
-			}
+		email := session.GetString(r.Context(), "email")
 
-			return
-		}
-
-		idToken, err := authenticator.VerifyRawToken(r.Context(), accessToken)
-		if err != nil {
-			log.Printf("forbidden - error verifying token in secured route: %s", err.Error())
-			
-			w.Header().Add("content-type", "text/plain")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, err := w.Write([]byte(fmt.Sprintf("forbidden - error verifying token: %s", err.Error())))
-			if err != nil {
-				log.Printf("error writing content: %s", err.Error())
-				return
-			}
-
-
-			return
-		}
-
-		isAllowed, err := authenticator.CheckClaims(r.Context(), idToken, requiredClaims...)
-		if err != nil {
-			log.Printf("error checking claims in secured route: %s", err.Error())
-			
-			w.Header().Add("content-type", "text/plain")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, err := w.Write([]byte("forbidden"))
-			if err != nil {
-				log.Printf("error writing content: %s", err.Error())
-				return
-			}
-
-			return
-		}
-		if !isAllowed {
-			w.Header().Add("content-type", "text/plain")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, err := w.Write([]byte("insufficient access rights"))
-			if err != nil {
-				log.Printf("error writing content: %s", err.Error())
-				return
-			}
-
-			return
-		}
-
-		email := authenticator.SessionManager.GetString(r.Context(), "email")
-
-		w.Header().Add("content-type", "text/plain")
+		w.Header().Add("content-type", "text/html")
 		w.WriteHeader(http.StatusOK)
-		_, err = w.Write([]byte(fmt.Sprintf("Hello %s", email)))
+		_, err = w.Write([]byte(fmt.Sprintf("<h2>Hello %s</h2>", email)))
+		if err != nil {
+			log.Print(err)
+			return
+		}
+	})
+}
+
+func homeRoute(session *scs.SessionManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+
+		w.Header().Add("content-type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, err = w.Write([]byte(`<h2>Welcome!</h2> <a href="/auth/login">Login</a> <a href="/test">Protected route</a>`))
 		if err != nil {
 			log.Print(err)
 			return
@@ -108,9 +67,12 @@ func main() {
 		return
 	}
 
+	// register the home route returning nothing but text for non logged in users
+	mux.Handle("/", sessionManager.LoadAndSave((homeRoute(sessionManager))))
+
 	// register the route to auth and wrap the final route with the
 	// authentication
-	mux.Handle("/test", sessionManager.LoadAndSave(authenticator.IsAuthenticated(securedRoute(authenticator, "read:test"))))
+	mux.Handle("/test", sessionManager.LoadAndSave(authenticator.Protect(helloRoute(sessionManager), "read:test")))
 
 	// register the authorization routes
 	mux.Handle("/auth/callback", sessionManager.LoadAndSave(authenticator.Callback()))
